@@ -36,6 +36,16 @@ from .secondary.loop import SecondaryLoop
 from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
 from .source.adjust import Adjustment, apply_adjustment
 from .source.source import HeatSource
+from .source.warmup import (
+    PENDING,
+    STARTED,
+    WARMING,
+    REACHED,
+    CANCELLED,
+    WarmupPlan,
+    WarmupRunner,
+    build_warmup_plan,
+)
 from .source.weather import WeatherPush, push_weather
 from .station.batch import build_plan
 from .station.mapping import StationMapping
@@ -93,6 +103,11 @@ class Platform:
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=self.config.quota.sample_period_s)
         self.ids = IdFactory("op")
+        self.warmup_ids = IdFactory("warmup")
+
+        # 已下发的起调安排：执行器在内存里推进，整份状态另落盘，跨重启后安排、
+        # 实际供温与审计仍能对上。
+        self.warmup_runners: dict[str, WarmupRunner] = {}
 
         self.zones = ZoneRegistry()
         self.curve = HeatCurve(self.config.curve)
@@ -201,6 +216,34 @@ class Platform:
         if trips:
             reason = str(trips[-1].payload.get("reason", "unknown"))
             self.source.trip(reason)
+        self._restore_curve_versions()
+        self._restore_warmup()
+
+    def _restore_curve_versions(self) -> None:
+        """从落盘恢复曲线版本台账，并把曲线当前状态对齐到最后一版。"""
+
+        raw = self.store.read("curve_versions")
+        if isinstance(raw, dict) and isinstance(raw.get("versions"), list):
+            self.curve.versions.absorb(raw["versions"])
+            self.curve.restore_state(self.curve.versions)
+
+    def _restore_warmup(self) -> None:
+        """从落盘状态恢复已下发的起调安排（按当时版本解释）。"""
+
+        raw = self.store.read("warmup_state")
+        if not isinstance(raw, dict):
+            return
+        runners = raw.get("runners")
+        if not isinstance(runners, dict):
+            return
+        for plan_id, item in runners.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                self.warmup_runners[str(plan_id)] = WarmupRunner.from_dict(item)
+            except (KeyError, TypeError, ValueError):
+                # 半份或形状不符的落盘不允许带着启动：忽略该条，靠审计追溯。
+                continue
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -209,6 +252,19 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+
+    def _persist_warmup(self) -> None:
+        """落盘全部起调安排及其执行状态。"""
+
+        self.store.write(
+            "warmup_state",
+            {"runners": {key: runner.as_dict() for key, runner in self.warmup_runners.items()}},
+        )
+
+    def _persist_curve_versions(self) -> None:
+        """落盘曲线版本台账，供跨重启追溯每一次换版。"""
+
+        self.store.write("curve_versions", {"versions": self.curve.versions.as_list()})
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -296,6 +352,7 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            epoch_before = self.curve.epoch()
             report = startup_plant(
                 self.source,
                 self.curve,
@@ -309,6 +366,8 @@ class Platform:
                 demand_pct,
             )
             summary = self._record_operation(op_id, "startup", report)
+            if report.get("ok"):
+                self._note_curve_revision(epoch_before, "startup")
             self._operations += 1
             self._persist()
             return {**report, **summary, "station": station}
@@ -338,6 +397,7 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            epoch_before = self.curve.epoch()
             report = push_weather(
                 self.source,
                 self.curve,
@@ -345,9 +405,33 @@ class Platform:
                 self.clock.now(),
             )
             summary = self._record_operation(op_id, "weather", report)
+            self._note_curve_revision(epoch_before, station)
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def _note_curve_revision(self, epoch_before: int, station: str = "console") -> None:
+        """若曲线发生换版，落一条可追溯代际的审计事件并持久化版本台账。"""
+
+        if self.curve.epoch() <= epoch_before:
+            return
+        version = self.curve.versions.current()
+        self.bus.publish(
+            Event.of(
+                "temp",
+                "temp",
+                "curve_revision",
+                severity="notice",
+                message=f"供热曲线换版至第 {self.curve.epoch()} 版",
+                epoch=self.curve.epoch(),
+                previous_epoch=epoch_before,
+                outdoor_c=round(self.curve.outdoor_c(), 2),
+                supply_c=round(self.curve.supply_c(), 2),
+                station=station,
+                issued_at=round(version.issued_at if version else self.clock.now(), 3),
+            )
+        )
+        self._persist_curve_versions()
 
     def adjust_source(
         self, temperature_c: float, flow_t_h: float, origin: str = "manual"
@@ -375,6 +459,269 @@ class Platform:
             )
             self._persist()
             return adjustment.as_dict()
+
+    # ---- 升温起调安排 -------------------------------------------------
+
+    def _observed_warmup_rates(self) -> list[float]:
+        """从供温趋势里估历史升温速率（℃/s），供"博一把"口径取均值。
+
+        只把连续单调升温的相邻样本算作一次真实升温，冷却段与平台段不进统计。
+        """
+
+        samples = self.trend.series("supply_c", limit=256)
+        rates: list[float] = []
+        for previous, current in zip(samples, samples[1:]):
+            dt = current.ts - previous.ts
+            if dt <= 0:
+                continue
+            delta = current.value - previous.value
+            if delta > 0:
+                rates.append(delta / dt)
+        return rates
+
+    def _require_runner(self, plan_id: str | None) -> WarmupRunner:
+        """取指定安排；不给标识时取最近一份仍在执行的安排。"""
+
+        if plan_id is None:
+            active = [
+                runner
+                for runner in self.warmup_runners.values()
+                if runner.state() in (PENDING, STARTED, WARMING)
+            ]
+            if not active:
+                raise InterlockError("当前没有可执行的起调安排", component="source")
+            return sorted(active, key=lambda item: item.plan.issued_at)[-1]
+        runner = self.warmup_runners.get(str(plan_id))
+        if runner is None:
+            raise InterlockError(f"起调安排 {plan_id} 不存在", component="source")
+        return runner
+
+    def issue_warmup_plan(
+        self,
+        target_c: float | None = None,
+        deadline_at: float | None = None,
+        origin: str = "console",
+    ) -> dict:
+        """按当前供温、目标供温与升温速率算出并下发一份起调安排。
+
+        安排在下发那一刻冻结当版曲线代际；目标取曲线当前目标供温（或显式给定）。
+        已在执行的旧安排被新版安排取代并作废，审计里保留作废原因。
+        """
+
+        with self._lock:
+            now = self.clock.now()
+            current = self.source.temperature_c()
+            target = self.curve.supply_c() if target_c is None else float(target_c)
+            if self.config.source.overtemperature(target):
+                raise InterlockError("起调目标供温越上限，拒绝下发", component="source")
+            if deadline_at is not None and float(deadline_at) <= now:
+                raise InterlockError("到目标期限已在当前时刻之前，无法倒排", component="source")
+
+            plan = build_warmup_plan(
+                plan_id=self.warmup_ids.next(),
+                source_type=self.config.source.source_type,
+                current_c=current,
+                target_c=target,
+                rated_rate_c_s=self.config.source.adjust_rate_c_s,
+                now=now,
+                curve_epoch=self.curve.epoch(),
+                curve_outdoor_c=self.curve.outdoor_c(),
+                deadline_at=None if deadline_at is None else float(deadline_at),
+                observed_rates_c_s=self._observed_warmup_rates(),
+            )
+            runner = WarmupRunner(plan)
+            superseded: list[str] = []
+            for existing in self.warmup_runners.values():
+                if existing.state() in (PENDING, STARTED, WARMING):
+                    existing.cancel(f"superseded_by:{plan.plan_id}")
+                    superseded.append(existing.plan_id)
+            self.warmup_runners[plan.plan_id] = runner
+
+            self.bus.publish(
+                Event.of(
+                    "source",
+                    "source",
+                    "warmup_issued",
+                    severity="notice",
+                    message=f"下发升温起调安排 {plan.plan_id}",
+                    plan_id=plan.plan_id,
+                    origin=origin,
+                    policy=plan.policy,
+                    curve_shape=plan.curve.shape,
+                    current_c=round(plan.current_c, 2),
+                    target_c=round(plan.target_c, 2),
+                    rate_c_s=round(plan.rate_c_s, 4),
+                    start_at=round(plan.start_at, 1),
+                    reach_at=round(plan.reach_at, 1),
+                    lead_s=round(plan.lead_s, 1),
+                    ramp_s=round(plan.ramp_s, 1),
+                    segments=len(plan.segments),
+                    curve_epoch=plan.curve.epoch,
+                    superseded=superseded,
+                )
+            )
+            for old_id in superseded:
+                self.bus.publish(
+                    Event.of(
+                        "source",
+                        "source",
+                        "warmup_cancelled",
+                        severity="warning",
+                        message=f"起调安排 {old_id} 被新安排取代",
+                        plan_id=old_id,
+                        reason=f"superseded_by:{plan.plan_id}",
+                    )
+                )
+            self._persist_warmup()
+            return runner.as_dict()
+
+    def start_warmup(self, plan_id: str | None = None, operator: str = "shift-lead") -> dict:
+        """起调：时序第一步。只能在升温与到目标之前发生。"""
+
+        with self._lock:
+            runner = self._require_runner(plan_id)
+            result = runner.start(self.clock.now())
+            self.bus.publish(
+                Event.of(
+                    "source",
+                    "source",
+                    "warmup_started",
+                    severity="notice",
+                    message=f"起调安排 {runner.plan_id} 开始起调",
+                    operator=operator,
+                    **result,
+                )
+            )
+            self._persist_warmup()
+            return runner.as_dict()
+
+    def complete_warmup(self, plan_id: str | None = None, operator: str = "shift-lead") -> dict:
+        """到目标确认：时序最后一步，实测供温必须落在目标带内。"""
+
+        with self._lock:
+            runner = self._require_runner(plan_id)
+            measured = self.source.temperature_c()
+            result = runner.complete(measured, self.clock.now())
+            self.bus.publish(
+                Event.of(
+                    "source",
+                    "source",
+                    "warmup_reached",
+                    severity="alarm" if result.get("overdue") else "notice",
+                    message=f"起调安排 {runner.plan_id} 到目标",
+                    operator=operator,
+                    **result,
+                )
+            )
+            self._persist_warmup()
+            return runner.as_dict()
+
+    def cancel_warmup(self, reason: str, plan_id: str | None = None, operator: str = "shift-lead") -> dict:
+        """作废一份起调安排（曲线换版、人工取消）。"""
+
+        with self._lock:
+            runner = self._require_runner(plan_id)
+            result = runner.cancel(reason)
+            self.bus.publish(
+                Event.of(
+                    "source",
+                    "source",
+                    "warmup_cancelled",
+                    severity="warning",
+                    message=f"起调安排 {runner.plan_id} 作废：{reason}",
+                    operator=operator,
+                    **result,
+                )
+            )
+            self._persist_warmup()
+            return runner.as_dict()
+
+    def track_warmup(self) -> dict:
+        """控制周期调用：让在执行的安排按分段线性期望推进并核对实际供温。"""
+
+        with self._lock:
+            now = self.clock.now()
+            measured = self.source.temperature_c()
+            reports: list[dict] = []
+            changed = False
+            for runner in self.warmup_runners.values():
+                if runner.state() not in (PENDING, STARTED, WARMING):
+                    continue
+                progress = runner.track(measured, now)
+                if progress["transitions"]:
+                    changed = True
+                    for transition in progress["transitions"]:
+                        self.bus.publish(
+                            Event.of(
+                                "source",
+                                "source",
+                                "warmup_progress",
+                                severity="notice",
+                                message=f"起调安排 {runner.plan_id} {transition}",
+                                plan_id=runner.plan_id,
+                                transition=transition,
+                                state=progress["state"],
+                                segment=progress["segment"],
+                                expected_c=progress["expected_c"],
+                                measured_c=progress["measured_c"],
+                            )
+                        )
+                if progress["lagging"]:
+                    self.bus.publish(
+                        Event.of(
+                            "source",
+                            "source",
+                            "warmup_lagging",
+                            severity="warning",
+                            message=f"起调安排 {runner.plan_id} 实际供温落后于安排",
+                            plan_id=runner.plan_id,
+                            expected_c=progress["expected_c"],
+                            measured_c=progress["measured_c"],
+                        )
+                    )
+                if progress["overdue"]:
+                    self.bus.publish(
+                        Event.of(
+                            "source",
+                            "source",
+                            "warmup_overdue",
+                            severity="alarm",
+                            message=f"起调安排 {runner.plan_id} 已超过到目标时刻",
+                            plan_id=runner.plan_id,
+                            reach_at=round(runner.plan.reach_at, 1),
+                            measured_c=progress["measured_c"],
+                        )
+                    )
+                reports.append(progress)
+            if changed:
+                self._persist_warmup()
+            return {"tracking": reports, "changed": changed}
+
+    def warmup_report(self, plan_id: str | None = None) -> dict:
+        """返回起调安排、执行状态与实际供温，供控制台展示与审计核对。"""
+
+        runners = list(self.warmup_runners.values())
+        if plan_id is not None:
+            runners = [runner for runner in runners if runner.plan_id == str(plan_id)]
+        runners.sort(key=lambda item: item.plan.issued_at)
+        now = self.clock.now()
+        measured = self.source.temperature_c()
+        return {
+            "curve_shape": "piecewise_linear",
+            "source_type": self.config.source.source_type,
+            "measured_c": round(measured, 2),
+            "target_c": round(self.curve.supply_c(), 2),
+            "curve_epoch": self.curve.epoch(),
+            "plans": [
+                {
+                    **runner.as_dict(),
+                    "lagging": runner.lagging(measured, now),
+                    "overdue": runner.is_overdue(now),
+                    "expected_c": round(runner.plan.expected_c(now), 2),
+                }
+                for runner in runners
+            ],
+        }
 
     def dispatch(
         self,
@@ -633,8 +980,9 @@ class Platform:
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
             self.trend.append("pressure_kpa", moment, self.secondary.pressure_kpa())
+            warmup = self.track_warmup()
             self._persist()
-            return {"cycle": self._cycles, **report}
+            return {"cycle": self._cycles, "warmup": warmup, **report}
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
         """用真实并行调用探测热源调整与热量采集的原子性。
@@ -787,6 +1135,7 @@ class Platform:
                 "trips": self.source.trips(),
             },
             "curve": self.curve_report(),
+            "warmup": self.warmup_report(),
             "primary": {
                 **self.network.snapshot().as_dict(),
                 "deviation_t_h": round(self.network.deviation_t_h(), 2),

@@ -12,12 +12,13 @@ from ..config import CurveLimits
 from ..errors import ForecastError
 from .state import CurveSnapshot
 from .table import CurveTable
+from .versioning import CurveVersion, CurveVersionRegistry
 
 
 class HeatCurve:
     """按气象更新的供热曲线。"""
 
-    def __init__(self, limits: CurveLimits) -> None:
+    def __init__(self, limits: CurveLimits, versions: CurveVersionRegistry | None = None) -> None:
         self._limits = limits
         self._table = CurveTable(limits)
         self._outdoor_c = (limits.outdoor_min_c + limits.outdoor_max_c) / 2.0
@@ -26,6 +27,36 @@ class HeatCurve:
         self._epoch = 0
         self._validated = 0
         self._rejected = 0
+        # 第 0 版是装配备好的基线曲线，之后每次气象推送换版都追加进同一本台账。
+        self._versions = versions if versions is not None else CurveVersionRegistry()
+        self._versions.register(
+            CurveVersion.create(
+                epoch=0,
+                outdoor_c=self._outdoor_c,
+                supply_c=self._supply_c,
+                issued_at=0.0,
+                points=tuple((point["outdoor_c"], point["supply_c"]) for point in self._table.points()),
+                note="baseline",
+            )
+        )
+
+    def restore_state(self, versions: CurveVersionRegistry) -> int:
+        """从版本台账恢复曲线当前状态，返回恢复后的代际。
+
+        曲线状态完全由"最新一版"决定：恢复时把当前室外温度、目标供温与代际
+        对齐到台账最后一版。基线（第 0 版）在装配时已登记，恢复数据以落盘为准。
+        """
+
+        current = versions.current()
+        if current is not None and current.epoch > 0:
+            self._versions = versions
+            self._epoch = current.epoch
+            self._outdoor_c = current.outdoor_c
+            self._supply_c = current.supply_c
+            self._updated_at = current.issued_at
+        else:
+            self._versions = versions
+        return self._epoch
 
     @property
     def limits(self) -> CurveLimits:
@@ -34,6 +65,10 @@ class HeatCurve:
     @property
     def table(self) -> CurveTable:
         return self._table
+
+    @property
+    def versions(self) -> CurveVersionRegistry:
+        return self._versions
 
     def outdoor_c(self) -> float:
         """返回当前曲线对应的室外温度。"""
@@ -87,6 +122,18 @@ class HeatCurve:
         self._supply_c = self._table.interpolate(value)
         self._updated_at = float(now)
         self._epoch += 1
+        self._versions.register(
+            CurveVersion.create(
+                epoch=self._epoch,
+                outdoor_c=self._outdoor_c,
+                supply_c=self._supply_c,
+                issued_at=self._updated_at,
+                points=tuple(
+                    (point["outdoor_c"], point["supply_c"]) for point in self._table.points()
+                ),
+                note="forecast",
+            )
+        )
         return {
             "outdoor_c": round(self._outdoor_c, 2),
             "supply_c": round(self._supply_c, 2),

@@ -46,7 +46,13 @@ class Api:
         add("GET", "/api/station/{name}", self._station)
         add("GET", "/api/valves", self._valves)
         add("GET", "/api/curve", self._curve)
+        add("GET", "/api/curve/versions", self._curve_versions)
         add("GET", "/api/forecast", self._forecast)
+        add("GET", "/api/warmup", self._warmup_report)
+        add("POST", "/api/warmup/issue", self._warmup_issue)
+        add("POST", "/api/warmup/start", self._warmup_start)
+        add("POST", "/api/warmup/complete", self._warmup_complete)
+        add("POST", "/api/warmup/cancel", self._warmup_cancel)
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
@@ -160,13 +166,59 @@ class Api:
     def _curve(self, params: dict, body: dict) -> dict:
         payload = self._platform.curve_report()
         payload["table"] = self._platform.curve.table.points()
+        payload["versions"] = self._platform.curve.versions.history()
         return payload
+
+    def _curve_versions(self, params: dict, body: dict) -> dict:
+        registry = self._platform.curve.versions
+        limit = params.get("limit")
+        versions = registry.history(None if limit is None else int(limit))
+        epoch = params.get("epoch")
+        return {
+            "count": registry.count(),
+            "current_epoch": self._platform.curve.epoch(),
+            "versions": versions,
+            "version": None if epoch is None else (registry.get(int(epoch)).as_dict() if registry.get(int(epoch)) else None),
+        }
 
     def _forecast(self, params: dict, body: dict) -> dict:
         outside = params.get("outdoor_c")
         horizon = int(params.get("steps", 5))
         return self._platform.outdoor_forecast(
             None if outside is None else float(outside), steps=horizon
+        )
+
+    def _warmup_report(self, params: dict, body: dict) -> dict:
+        plan_id = params.get("plan_id")
+        return self._platform.warmup_report(None if plan_id is None else str(plan_id))
+
+    def _warmup_issue(self, params: dict, body: dict) -> dict:
+        target = body.get("target_c")
+        deadline = body.get("deadline_at")
+        return self._platform.issue_warmup_plan(
+            None if target is None else float(target),
+            None if deadline is None else float(deadline),
+            str(body.get("origin", "console")),
+        )
+
+    def _warmup_start(self, params: dict, body: dict) -> dict:
+        plan_id = body.get("plan_id")
+        return self._platform.start_warmup(
+            None if plan_id is None else str(plan_id), str(body.get("operator", "shift-lead"))
+        )
+
+    def _warmup_complete(self, params: dict, body: dict) -> dict:
+        plan_id = body.get("plan_id")
+        return self._platform.complete_warmup(
+            None if plan_id is None else str(plan_id), str(body.get("operator", "shift-lead"))
+        )
+
+    def _warmup_cancel(self, params: dict, body: dict) -> dict:
+        plan_id = body.get("plan_id")
+        return self._platform.cancel_warmup(
+            str(body.get("reason", "manual-cancel")),
+            None if plan_id is None else str(plan_id),
+            str(body.get("operator", "shift-lead")),
         )
 
     def _pressure(self, params: dict, body: dict) -> dict:

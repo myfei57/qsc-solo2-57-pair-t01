@@ -18,6 +18,11 @@ from .errors import ConfigError
 
 _MISSING = object()
 
+# 支持的热源类型。起调安排的保守策略按热源类型在这里定死，不接受现场临时换口径：
+# 燃煤炉惯性大、压火代价高，按最慢可信速率留足余量；燃气炉、电热源与热电联产
+# 调节灵活，按历史均值博一把。策略表本体在 heatnet.source.warmup 里。
+SOURCE_TYPES = ("coal_fired", "gas_fired", "electric", "chp")
+
 
 def _section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = mapping.get(key)
@@ -51,9 +56,16 @@ class SourceLimits:
     flow_max_t_h: float
     quality_confirm_s: float
     adjust_rate_c_s: float
+    source_type: str = "coal_fired"
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "SourceLimits":
+        source_type = str(section.get("source_type", "coal_fired"))
+        if source_type not in SOURCE_TYPES:
+            raise ConfigError(
+                f"未知热源类型 {source_type!r}，允许取值：{', '.join(SOURCE_TYPES)}",
+                component="config",
+            )
         limits = cls(
             supply_target_c=_number(section, "supply_target_c", minimum=1.0),
             supply_max_c=_number(section, "supply_max_c", minimum=1.0),
@@ -62,6 +74,7 @@ class SourceLimits:
             flow_max_t_h=_number(section, "flow_max_t_h", minimum=1.0),
             quality_confirm_s=_number(section, "quality_confirm_s", minimum=0.1),
             adjust_rate_c_s=_number(section, "adjust_rate_c_s", minimum=0.01),
+            source_type=source_type,
         )
         if limits.supply_target_c >= limits.supply_max_c:
             raise ConfigError("热源目标供温必须低于上限", component="config")
@@ -336,7 +349,7 @@ def default_config() -> PlatformConfig:
     return PlatformConfig(
         name="heatnet",
         storage_root="var/state",
-        source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
+        source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35, "coal_fired"),
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
@@ -362,6 +375,7 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "flow_max_t_h": cfg.source.flow_max_t_h,
                 "quality_confirm_s": cfg.source.quality_confirm_s,
                 "adjust_rate_c_s": cfg.source.adjust_rate_c_s,
+                "source_type": cfg.source.source_type,
             },
             "curve": {
                 "outdoor_min_c": cfg.curve.outdoor_min_c,
