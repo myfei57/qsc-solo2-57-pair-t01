@@ -47,6 +47,7 @@ class Api:
         add("GET", "/api/valves", self._valves)
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
+        add("GET", "/api/ramp", lambda params, body: self._platform.ramp_report())
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
@@ -60,6 +61,7 @@ class Api:
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/weather", self._weather)
         add("POST", "/api/adjust", self._adjust)
+        add("POST", "/api/ramp", self._ramp)
         add("POST", "/api/startup", self._startup)
         add("POST", "/api/shutdown", self._shutdown)
         add("POST", "/api/dispatch", self._dispatch)
@@ -259,6 +261,15 @@ class Api:
         return self._platform.adjust_source(
             _as_float(body, "temperature_c", self._platform.source.temperature_c()),
             _as_float(body, "flow_t_h", self._platform.network.baseline_t_h()),
+            str(body.get("origin", "console")),
+        )
+
+    def _ramp(self, params: dict, body: dict) -> dict:
+        target = body.get("target_c")
+        arrive = body.get("arrive_in_s")
+        return self._platform.plan_ramp(
+            None if target is None else _as_float(body, "target_c", 0.0),
+            None if arrive is None else _as_float(body, "arrive_in_s", 0.0),
             str(body.get("origin", "console")),
         )
 

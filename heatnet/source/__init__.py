@@ -8,8 +8,20 @@
 from __future__ import annotations
 
 from .adjust import Adjustment, apply_adjustment
+from .ramp import RampPlan, RampSegment, RampTracker, build_ramp_plan
 from .source import HeatSource
 from .state import SourceSnapshot
 from .weather import WeatherPush, push_weather
 
-__all__ = ["Adjustment", "HeatSource", "SourceSnapshot", "WeatherPush", "apply_adjustment", "push_weather"]
+__all__ = [
+    "Adjustment",
+    "HeatSource",
+    "RampPlan",
+    "RampSegment",
+    "RampTracker",
+    "SourceSnapshot",
+    "WeatherPush",
+    "apply_adjustment",
+    "build_ramp_plan",
+    "push_weather",
+]

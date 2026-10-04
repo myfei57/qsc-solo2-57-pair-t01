@@ -1,9 +1,9 @@
 """平台装配与控制循环。
 
 ``Platform`` 把热源、一次网、换热站、二次网、阀门、泵、曲线、定压、热量与审计
-按真实调用链装到一起，并暴露四件事：操作编排（气象推送、调质调量、投运、调度、
-停运、拆分、定压改造）、控制循环、并发探测与状态快照。控制循环每个周期推进热源
-与二次网、把一次网跟随上去、落审计并采集趋势。
+按真实调用链装到一起，并暴露四件事：操作编排（气象推送、调质调量、起调安排、
+投运、调度、停运、拆分、定压改造）、控制循环、并发探测与状态快照。控制循环
+每个周期推进热源与二次网、把一次网跟随上去、落审计并采集趋势。
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from .secondary.cycle import run_cycle
 from .secondary.loop import SecondaryLoop
 from .sequence import advance_heating, dispatch_demand, recalibrate_flow, shutdown_plant, startup_plant
 from .source.adjust import Adjustment, apply_adjustment
+from .source.ramp import RampTracker, build_ramp_plan
 from .source.source import HeatSource
 from .source.weather import WeatherPush, push_weather
 from .station.batch import build_plan
@@ -97,6 +98,7 @@ class Platform:
         self.zones = ZoneRegistry()
         self.curve = HeatCurve(self.config.curve)
         self.source = HeatSource(self.config.source)
+        self.ramps = RampTracker(self.config.ramp)
         self.network = PrimaryNetwork(self.config.primary)
         self.secondary = SecondaryLoop(self.config.secondary)
         self._build_zones()
@@ -345,6 +347,20 @@ class Platform:
                 self.clock.now(),
             )
             summary = self._record_operation(op_id, "weather", report)
+            active = self.ramps.active()
+            if report.get("ok") and active is not None and active.curve_epoch != self.curve.epoch():
+                self.bus.publish(
+                    Event.of(
+                        "ramp",
+                        "ramp",
+                        "ramp_curve_revised",
+                        severity="warning",
+                        message="曲线换版，已下发的起调安排仍按当时版本执行",
+                        plan_id=active.plan_id,
+                        plan_epoch=active.curve_epoch,
+                        curve_epoch=self.curve.epoch(),
+                    )
+                )
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -375,6 +391,90 @@ class Platform:
             )
             self._persist()
             return adjustment.as_dict()
+
+    def plan_ramp(
+        self,
+        target_c: float | None = None,
+        arrive_in_s: float | None = None,
+        origin: str = "console",
+    ) -> dict:
+        """按当前供温、目标供温与升温速率下发一份起调安排。
+
+        安排按分段线性计算：什么时候起调、分几段爬、每段到多少，一次算清并钉死
+        当时的曲线代际；中途曲线换版不影响已下发的安排。
+        """
+
+        with self._lock:
+            now = self.clock.now()
+            target = self.curve.supply_c() if target_c is None else float(target_c)
+            arrive_by = None
+            if arrive_in_s is not None:
+                if float(arrive_in_s) <= 0:
+                    raise ValueError("到点时限必须为正")
+                arrive_by = now + float(arrive_in_s)
+            plan = build_ramp_plan(
+                plan_id=self.ids.next(),
+                start_c=self.source.temperature_c(),
+                target_c=target,
+                now=now,
+                limits=self.config.ramp,
+                curve_epoch=self.curve.epoch(),
+                adjust_rate_c_s=self.config.source.adjust_rate_c_s,
+                arrive_by=arrive_by,
+            )
+            superseded = self.ramps.issue(plan)
+            if superseded is not None:
+                self.bus.publish(
+                    Event.of(
+                        "ramp",
+                        "ramp",
+                        "ramp_superseded",
+                        severity="warning",
+                        message="起调安排被新版取代",
+                        **superseded,
+                    )
+                )
+            payload = plan.as_dict()
+            self.bus.publish(
+                Event.of(
+                    "ramp",
+                    "ramp",
+                    "ramp_planned",
+                    severity="notice",
+                    message=f"起调安排 {plan.plan_id}（{plan.strategy}）",
+                    origin=origin,
+                    **payload,
+                )
+            )
+            self._operations += 1
+            self._persist()
+            return {
+                "ok": True,
+                "plan": payload,
+                "progress": self.ramps.progress(now, self.source.temperature_c()),
+            }
+
+    def ramp_report(self) -> dict:
+        """返回起调安排、执行进度与历史，供控制台展示。"""
+
+        now = self.clock.now()
+        report = self.ramps.report(now, self.source.temperature_c())
+        plan = report["plan"]
+        report["curve_epoch"] = self.curve.epoch()
+        report["curve_revised"] = plan is not None and plan["curve_epoch"] != self.curve.epoch()
+        report["source_kind"] = self.config.ramp.source_kind
+        report["strategy"] = self.config.ramp.strategy()
+        return report
+
+    def _advance_ramps(self, moment: float) -> None:
+        """按当前时刻与实际供温推进起调安排，把每次跃迁落审计。"""
+
+        for transition in self.ramps.advance(moment, self.source.temperature_c()):
+            action = str(transition.pop("action"))
+            message = str(transition.pop("message", ""))
+            self.bus.publish(
+                Event.of("ramp", "ramp", action, severity="notice", message=message, **transition)
+            )
 
     def dispatch(
         self,
@@ -629,6 +729,7 @@ class Platform:
             report = advance_heating(
                 self.source, self.curve, self.network, self.secondary, flow, moment, dt
             )
+            self._advance_ramps(moment)
             self.trend.append("supply_c", moment, self.source.temperature_c())
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
@@ -787,6 +888,7 @@ class Platform:
                 "trips": self.source.trips(),
             },
             "curve": self.curve_report(),
+            "ramp": self.ramp_report(),
             "primary": {
                 **self.network.snapshot().as_dict(),
                 "deviation_t_h": round(self.network.deviation_t_h(), 2),

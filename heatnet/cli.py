@@ -4,8 +4,9 @@
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``    在本地跑一遍完整流程（气象推送 → 调质调量 → 投运 → 调度下发 →
-            控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
-            分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
+            起调安排 → 控制周期 → 流量标定 → 定压改造 → 二次网循环 →
+            热量采集与结算 → 分区拆分 → 阀门队列回放 → 停机与复位），
+            用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -31,6 +32,7 @@ DEFAULT_PROBE_PATHS = (
     "/api/audit",
     "/api/stations",
     "/api/quota",
+    "/api/ramp",
 )
 
 
@@ -85,7 +87,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     launch = platform.startup(args.outdoor_c, args.demand_pct, "demo-operator")
     preview = platform.plan_preview(args.demand_pct)
     dispatch = platform.dispatch(args.demand_pct, args.target_c, None, None)
+    # 起调安排：按当前供温、目标供温与热源类型的速率策略算出分段线性爬升表，
+    # 随后由值班员把热源调整到位，控制周期会按实际供温推进安排并落审计。
+    ramp_target = args.ramp_target_c
+    if ramp_target is None:
+        ramp_target = min(platform.curve.supply_c() + 12.0, platform.config.source.supply_max_c - 1.0)
+    ramp = platform.plan_ramp(ramp_target, args.ramp_arrive_in_s or None, "demo-operator")
+    ramp_exec = platform.adjust_source(ramp_target, platform.source.flow_t_h(), "demo-ramp")
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
+    ramp_after = platform.ramp_report()
     calibration = platform.calibrate_flow(args.baseline_t_h)
     retrofit = platform.retrofit_baseline(args.baseline_kpa)
     secondary = platform.secondary_cycle(args.dt)
@@ -114,6 +124,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             key: dispatch[key]
             for key in ("ok", "planned", "adjusted", "target_c", "flow_t_h", "threshold_t_h", "violations")
         },
+        "ramp": {
+            "ok": ramp["ok"],
+            "plan": ramp["plan"],
+            "executed": ramp_exec["ok"],
+            "after": ramp_after["progress"],
+        },
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "calibration": calibration,
@@ -138,6 +154,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         ("weather", weather),
         ("launch", launch),
         ("dispatch", dispatch),
+        ("ramp", ramp),
         ("secondary", secondary),
         ("retrofit", retrofit),
         ("concurrency", concurrency),
@@ -197,6 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--outdoor-c", type=float, default=-5.0, help="演示用的室外温度 (℃)")
     demo.add_argument("--demand-pct", type=float, default=60.0, help="演示用的负荷需求 (%)")
     demo.add_argument("--target-c", type=float, default=60.0, help="演示用的二次侧设定点 (℃)")
+    demo.add_argument("--ramp-target-c", type=float, default=None, help="起调安排的目标供温 (℃)，缺省按曲线供温上浮")
+    demo.add_argument("--ramp-arrive-in-s", type=float, default=0.0, help="要求多少秒内到目标，0 表示立即起调")
     demo.add_argument("--cycles", type=int, default=240, help="演示控制周期数")
     demo.add_argument("--dt", type=float, default=1.0, help="控制周期步长（秒）")
     demo.add_argument("--rounds", type=int, default=24, help="并发探测轮数")

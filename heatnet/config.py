@@ -1,10 +1,10 @@
 """平台配置。
 
 配置来自 JSON 文件（标准库解析），覆盖热源供温带与调质确认时间、供热曲线的
-室外温度区间与过期时间、换热站混水阀行程与批量确认时间、一次网流量基线与
-调度速率、二次网补水定压带、阀门行程公差、循环泵升速斜率、定压基线范围与
-热量表回绕阈值，以及状态存储目录。任何缺失或越界取值都在装配阶段抛出
-:class:`ConfigError`，不允许带着半份配置启动控制链。
+室外温度区间与过期时间、起调安排的分段与速率策略、换热站混水阀行程与批量确认
+时间、一次网流量基线与调度速率、二次网补水定压带、阀门行程公差、循环泵升速
+斜率、定压基线范围与热量表回绕阈值，以及状态存储目录。任何缺失或越界取值都
+在装配阶段抛出 :class:`ConfigError`，不允许带着半份配置启动控制链。
 """
 
 from __future__ import annotations
@@ -80,6 +80,51 @@ class SourceLimits:
         """流量是否落在可信区间内。"""
 
         return self.flow_min_t_h <= float(flow_t_h) <= self.flow_max_t_h
+
+
+# 起调速率策略按热源类型定死：燃煤机组惯性大，按最慢速率排程并把余量前置到起调
+# 时刻；燃气机组响应快，按历史均值速率排程。
+RAMP_STRATEGIES = {"coal": "conservative", "gas": "average"}
+
+
+@dataclass(frozen=True)
+class RampLimits:
+    """起调安排的分段参数、速率策略与到目标确认带。"""
+
+    source_kind: str
+    segment_step_c: float
+    segments_max: int
+    rate_slow_c_s: float
+    rate_avg_c_s: float
+    lead_margin_s: float
+    reach_band_c: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "RampLimits":
+        kind = section.get("source_kind", _MISSING)
+        if kind is _MISSING:
+            raise ConfigError("配置缺少字段 'source_kind'", component="config")
+        if not isinstance(kind, str) or kind not in RAMP_STRATEGIES:
+            raise ConfigError(
+                f"热源类型 {kind!r} 未知（可选 {sorted(RAMP_STRATEGIES)}）", component="config"
+            )
+        limits = cls(
+            source_kind=kind,
+            segment_step_c=_number(section, "segment_step_c", minimum=0.1),
+            segments_max=int(_number(section, "segments_max", minimum=1.0)),
+            rate_slow_c_s=_number(section, "rate_slow_c_s", minimum=0.01),
+            rate_avg_c_s=_number(section, "rate_avg_c_s", minimum=0.01),
+            lead_margin_s=_number(section, "lead_margin_s", minimum=0.0),
+            reach_band_c=_number(section, "reach_band_c", minimum=0.1),
+        )
+        if limits.rate_avg_c_s < limits.rate_slow_c_s:
+            raise ConfigError("历史均值速率不得低于最慢速率", component="config")
+        return limits
+
+    def strategy(self) -> str:
+        """按热源类型定速率策略（保守留余量 / 按历史均值）。"""
+
+        return RAMP_STRATEGIES[self.source_kind]
 
 
 @dataclass(frozen=True)
@@ -284,6 +329,7 @@ class PlatformConfig:
     storage_root: str
     source: SourceLimits
     curve: CurveLimits
+    ramp: RampLimits
     station: StationLimits
     primary: PrimaryLimits
     secondary: SecondaryLimits
@@ -308,6 +354,7 @@ class PlatformConfig:
             storage_root=storage_root,
             source=SourceLimits.from_mapping(_section(limits, "source")),
             curve=CurveLimits.from_mapping(_section(limits, "curve")),
+            ramp=RampLimits.from_mapping(_section(limits, "ramp")),
             station=StationLimits.from_mapping(_section(limits, "station")),
             primary=PrimaryLimits.from_mapping(_section(limits, "primary")),
             secondary=SecondaryLimits.from_mapping(_section(limits, "secondary")),
@@ -338,6 +385,7 @@ def default_config() -> PlatformConfig:
         storage_root="var/state",
         source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
+        ramp=RampLimits("coal", 4.0, 6, 0.2, 0.3, 600.0, 0.5),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
@@ -369,6 +417,15 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "supply_low_c": cfg.curve.supply_low_c,
                 "supply_high_c": cfg.curve.supply_high_c,
                 "stale_after_s": cfg.curve.stale_after_s,
+            },
+            "ramp": {
+                "source_kind": cfg.ramp.source_kind,
+                "segment_step_c": cfg.ramp.segment_step_c,
+                "segments_max": cfg.ramp.segments_max,
+                "rate_slow_c_s": cfg.ramp.rate_slow_c_s,
+                "rate_avg_c_s": cfg.ramp.rate_avg_c_s,
+                "lead_margin_s": cfg.ramp.lead_margin_s,
+                "reach_band_c": cfg.ramp.reach_band_c,
             },
             "station": {
                 "setpoint_c": cfg.station.setpoint_c,

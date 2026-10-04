@@ -20,6 +20,15 @@
       "supply_high_c": 95.0,
       "stale_after_s": 1800.0
     },
+    "ramp": {
+      "source_kind": "coal",
+      "segment_step_c": 4.0,
+      "segments_max": 6,
+      "rate_slow_c_s": 0.2,
+      "rate_avg_c_s": 0.3,
+      "lead_margin_s": 600.0,
+      "reach_band_c": 0.5
+    },
     "station": {
       "setpoint_c": 60.0,
       "setpoint_band_c": 2.5,
